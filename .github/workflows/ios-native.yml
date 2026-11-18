@@ -1,0 +1,235 @@
+name: iPhone native app - UNSIGNED
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: moru-ios-native
+  cancel-in-progress: false
+
+jobs:
+  ios-native:
+    # Standard public-repository runners only; do not consume private billing.
+    if: ${{ github.event.repository.private == false && github.event.repository.visibility == 'public' }}
+    runs-on: macos-15
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      FLUTTER_VERSION: '3.44.8'
+      FLUTTER_COMMIT: '058e0af2c2b57e369d905a03ac9748b0ebf543c6'
+      DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
+      FLUTTER_SUPPRESS_ANALYTICS: 'true'
+      DART_SUPPRESS_ANALYTICS: 'true'
+      CI: 'true'
+    steps:
+      - name: Check out the approved public source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Prepare source and build report
+        run: |
+          set -euo pipefail
+          artifacts="$RUNNER_TEMP/moru-ios-artifacts"
+          mkdir -p "$artifacts"
+          printf 'ARTIFACT_DIR=%s\n' "$artifacts" >> "$GITHUB_ENV"
+          {
+            printf '# moru iPhone native build - UNSIGNED\n\n'
+            printf -- '- Repository: %s\n' "$GITHUB_REPOSITORY"
+            printf -- '- Source commit: %s\n' "$GITHUB_SHA"
+            printf -- '- Run: %s/%s/actions/runs/%s\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+            printf -- '- Started UTC: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            printf -- '- This is an unsigned device build. Personal signing and iPhone installation are separate.\n'
+            printf -- '- No Apple Account, certificate, profile, or App Store publishing credentials are used.\n'
+          } > "$artifacts/BUILD-REPORT.md"
+
+          if [[ -f "$GITHUB_WORKSPACE/pubspec.yaml" ]]; then
+            project="$GITHUB_WORKSPACE"
+          else
+            archive="$GITHUB_WORKSPACE/moru-native-source.zip"
+            [[ -f "$archive" ]] || { echo 'Missing pubspec.yaml and moru-native-source.zip'; exit 1; }
+            project="$RUNNER_TEMP/moru-ios-project"
+            mkdir -p "$project"
+            ditto -x -k "$archive" "$project"
+            if [[ ! -f "$project/pubspec.yaml" && -f "$project/moru_editor/pubspec.yaml" ]]; then
+              project="$project/moru_editor"
+            fi
+            [[ -f "$project/pubspec.yaml" ]] || { echo 'Source ZIP must contain pubspec.yaml at its root or inside moru_editor/'; exit 1; }
+            shasum -a 256 "$archive" > "$artifacts/source-archive.sha256"
+          fi
+          [[ -f "$project/tool/fetch_native_models.py" ]] || { echo 'Missing verified model fetch script'; exit 1; }
+          printf 'PROJECT_DIR=%s\n' "$project" >> "$GITHUB_ENV"
+          printf -- '- Build host: %s / %s\n' "$(sw_vers -productVersion)" "$(uname -m)" >> "$artifacts/BUILD-REPORT.md"
+          # Current standard macos-15 is arm64. Refuse an unexpected Intel
+          # host: this package has no macOS-x64 runtime for its real-model tests.
+          [[ "$(uname -m)" == 'arm64' ]] || { echo 'Expected the standard ARM64 macos-15 runner'; exit 1; }
+          [[ -d "$DEVELOPER_DIR" ]] || { echo 'Xcode 26.2 is missing from this runner image; review the pinned image before changing versions'; exit 1; }
+          sudo xcode-select --switch "$DEVELOPER_DIR"
+          xcodebuild -version | tee "$artifacts/xcode-version.txt"
+          xcodebuild -version | grep -q '^Xcode 26\.2$'
+
+      - name: Install the pinned official Flutter SDK
+        run: |
+          set -euo pipefail
+          sdk="$RUNNER_TEMP/moru-flutter"
+          git clone --depth 1 --branch "$FLUTTER_VERSION" https://github.com/flutter/flutter.git "$sdk"
+          [[ "$(git -C "$sdk" rev-parse HEAD)" == "$FLUTTER_COMMIT" ]] || { echo 'Flutter tag does not match the reviewed commit'; exit 1; }
+          printf '%s\n' "$sdk/bin" >> "$GITHUB_PATH"
+          "$sdk/bin/flutter" --no-version-check config --no-analytics
+          "$sdk/bin/flutter" --no-version-check --version | tee "$ARTIFACT_DIR/flutter-version.txt"
+          "$sdk/bin/flutter" --no-version-check precache --ios
+          pod --version | tee "$ARTIFACT_DIR/cocoapods-version.txt"
+
+      - name: Fetch and verify the official model files
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          # The upload kit intentionally omits these large binaries. The
+          # checked-in script accepts only the reviewed URLs and SHA-256s.
+          python3 tool/fetch_native_models.py 2>&1 | tee "$ARTIFACT_DIR/model-fetch.log"
+
+      - name: Resolve locked dependencies and check bundled models
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          flutter --no-version-check pub get --enforce-lockfile 2>&1 | tee "$ARTIFACT_DIR/pub-get.log"
+          dart run mediapipe_core:bundle_models --check 2>&1 | tee "$ARTIFACT_DIR/model-bundle-check.log"
+
+      - name: Analyze and run the real native model tests
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          flutter --no-version-check analyze --no-pub 2>&1 | tee "$ARTIFACT_DIR/analyze.log"
+          flutter --no-version-check test --no-pub --concurrency=1 --reporter expanded 2>&1 | tee "$ARTIFACT_DIR/tests.log"
+
+      - name: Compile the native iPhone release without signing
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          flutter --no-version-check build ios --release --no-codesign --no-pub 2>&1 | tee "$ARTIFACT_DIR/ios-build.log"
+
+      - name: Verify the device bundle and package the unsigned IPA
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          export APP_DIR="$PROJECT_DIR/build/ios/iphoneos/Runner.app"
+          [[ -d "$APP_DIR" ]] || { echo 'Native Runner.app was not produced'; exit 1; }
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import plistlib
+          import subprocess
+
+          project = pathlib.Path(os.environ['PROJECT_DIR'])
+          app = pathlib.Path(os.environ['APP_DIR'])
+          out = pathlib.Path(os.environ['ARTIFACT_DIR'])
+          with (app / 'Info.plist').open('rb') as stream:
+              info = plistlib.load(stream)
+          executable = app / info['CFBundleExecutable']
+          if 'iPhoneOS' not in info.get('CFBundleSupportedPlatforms', []):
+              raise SystemExit('This is not an iPhoneOS device bundle')
+          if tuple(int(x) for x in info['MinimumOSVersion'].split('.')) < (15,):
+              raise SystemExit('MediaPipe requires an iOS deployment target of at least 15.0')
+
+          def command(*args):
+              return subprocess.check_output(args, text=True).strip()
+
+          def arm64_binary(path):
+              if not path.is_file():
+                  raise SystemExit(f'Missing native binary: {path}')
+              description = command('file', '-b', str(path))
+              archs = command('xcrun', 'lipo', '-archs', str(path)).split()
+              if 'Mach-O' not in description or 'arm64' not in archs:
+                  raise SystemExit(f'Expected an ARM64 Mach-O binary: {path}')
+              return {'path': str(path.relative_to(app)), 'architectures': archs, 'file': description}
+
+          main_binary = arm64_binary(executable)
+          aot_binary = arm64_binary(app / 'Frameworks/App.framework/App')
+          ffi_path = app / 'Frameworks/MediaPipeTasksVisionC.framework/MediaPipeTasksVisionC'
+          ffi_binary = arm64_binary(ffi_path)
+          symbols = command('xcrun', 'nm', '-gU', str(ffi_path))
+          for name in ('MpFaceLandmarkerCreate', 'MpImageSegmenterCreate'):
+              if name not in symbols:
+                  raise SystemExit(f'MediaPipe FFI export is missing: {name}')
+          asset_roots = list(app.rglob('flutter_assets'))
+          if len(asset_roots) != 1:
+              raise SystemExit(f'Expected one Flutter asset bundle, found {len(asset_roots)}')
+          models = []
+          for relative in (
+              'assets/mediapipe/64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff',
+              'assets/models/selfie_multiclass_256x256.tflite',
+          ):
+              source, bundled = project / relative, asset_roots[0] / relative
+              if not source.is_file() or not bundled.is_file():
+                  raise SystemExit(f'Model missing from the native app: {relative}')
+              digest = hashlib.sha256(bundled.read_bytes()).hexdigest()
+              if digest != hashlib.sha256(source.read_bytes()).hexdigest():
+                  raise SystemExit(f'Bundled model differs from the verified source: {relative}')
+              models.append({'path': relative, 'bytes': bundled.stat().st_size, 'sha256': digest})
+          if (app / 'embedded.mobileprovision').exists():
+              raise SystemExit('Unexpected provisioning profile in this credential-free unsigned build')
+          signature = subprocess.run(['codesign', '-dv', '--verbose=2', str(app)],
+                                     text=True, capture_output=True)
+          (out / 'codesign-status.txt').write_text(signature.stdout + signature.stderr, encoding='utf-8')
+          metadata = {
+              'status': 'native-device-bundle-verified', 'signing': 'UNSIGNED-needs-personal-signing',
+              'bundleIdentifier': info['CFBundleIdentifier'],
+              'displayName': info.get('CFBundleDisplayName', info.get('CFBundleName')),
+              'version': info['CFBundleShortVersionString'], 'build': info['CFBundleVersion'],
+              'minimumIOSVersion': info['MinimumOSVersion'],
+              'supportedPlatforms': info['CFBundleSupportedPlatforms'],
+              'mainBinary': main_binary, 'aotBinary': aot_binary,
+              'mediaPipeFFI': ffi_binary, 'models': models,
+              'repositoryCommit': os.environ['GITHUB_SHA'],
+              'flutterCommit': os.environ['FLUTTER_COMMIT'], 'xcode': '26.2',
+          }
+          (out / 'bundle-metadata.json').write_text(json.dumps(metadata, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+          print(json.dumps(metadata, indent=2, ensure_ascii=False))
+          PY
+          staging="$RUNNER_TEMP/moru-ios-package"
+          mkdir -p "$staging/Payload"
+          ditto "$APP_DIR" "$staging/Payload/Runner.app"
+          # ditto preserves framework symlinks; the archive root is Payload/.
+          (cd "$staging" && ditto -c -k --sequesterRsrc --keepParent Payload "$ARTIFACT_DIR/moru-ios-unsigned.ipa")
+          if [[ -f docs/IOS_WINDOWS.md ]]; then
+            cp docs/IOS_WINDOWS.md "$ARTIFACT_DIR/INSTALL-WINDOWS.md"
+          fi
+          (cd "$ARTIFACT_DIR" && shasum -a 256 moru-ios-unsigned.ipa > SHA256SUMS.txt)
+          printf '\nNative ARM64 app, AOT code, MediaPipe FFI exports, and both model assets passed validation.\n' >> "$ARTIFACT_DIR/BUILD-REPORT.md"
+
+      - name: Record the actual job result
+        if: always()
+        env:
+          RESULT: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          artifacts="$RUNNER_TEMP/moru-ios-artifacts"
+          mkdir -p "$artifacts"
+          {
+            printf '\n## Result\n\n'
+            printf -- '- Job status before artifact upload: %s\n' "$RESULT"
+            printf -- '- Finished UTC: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            if [[ -f "$artifacts/moru-ios-unsigned.ipa" ]]; then
+              printf -- '- IPA: moru-ios-unsigned.ipa (UNSIGNED; requires personal signing)\n'
+            else
+              printf -- '- No IPA produced. Read the failed step and attached logs; this is not a completed iPhone build.\n'
+            fi
+          } >> "$artifacts/BUILD-REPORT.md"
+          cat "$artifacts/BUILD-REPORT.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload unsigned app or failure diagnostics for one day
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: moru-ios-UNSIGNED-${{ github.run_number }}
+          path: ${{ runner.temp }}/moru-ios-artifacts/
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
